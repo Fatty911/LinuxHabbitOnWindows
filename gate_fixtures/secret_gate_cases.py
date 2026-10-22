@@ -42,11 +42,56 @@ class GateTests(unittest.TestCase):
         value = 'bedrock-api-key-' + base64.b64encode(b'bedrock.amazonaws.com').decode()
         rev = self.commit({'fixture.txt': value})
         self.assertIn('aws-amazon-bedrock-api-key-short-lived', {r['rule'] for r in gate.check(self.repo, rev)['findings']})
-    def test_policy_representation_preserves_exact_parsed_values(self):
+    def test_tightened_policy_exact_parsed_values(self):
         parsed = tomllib.loads((gate.BASE / 'trusted-derived.toml').read_text())
-        self.assertEqual(hashlib.sha256(json.dumps(parsed, sort_keys=True, separators=(',', ':')).encode()).hexdigest(), '3fbe281cf35acb0c045d749f3dd18e89dc01b9afa3ea78d8d25efc3d3cf368a8')
+        self.assertEqual(hashlib.sha256(json.dumps(parsed, sort_keys=True, separators=(',', ':')).encode()).hexdigest(), '82d10d652f3d34b6a0e9021bde817bb909a63fa28593042455f63121c96e97ae')
         parsed = tomllib.loads((gate.BASE / 'upstream/gitleaks.toml').read_text())
-        self.assertEqual(hashlib.sha256(json.dumps(parsed, sort_keys=True, separators=(',', ':')).encode()).hexdigest(), 'e3edafaca0db7ad5ca56df59f80ada25d6d616ddb7b7d2bc2a78e89e4643e21e')
+        self.assertEqual(hashlib.sha256(json.dumps(parsed, sort_keys=True, separators=(',', ':')).encode()).hexdigest(), 'a7a30d0d3e61f206188d79f91ce9406dfcd0336b514b1000366a76efdeec394c')
+    def test_synthetic_google_key_detected(self):
+        value = 'AI' + 'za' + base64.urlsafe_b64encode(hashlib.sha256(b'fabricated Google shape only').digest()).decode()[:35]
+        rev = self.commit({'fixture.txt': value})
+        self.assertIn('gcp-api-key', {r['rule'] for r in gate.check(self.repo, rev)['findings']})
+    def test_policy_key_shape_raw_and_parsed_rejection(self):
+        value = 'AI' + 'za' + hashlib.sha256(b'fabricated policy shape only').hexdigest()[:35]
+        escaped = ''.join('\\u%04x' % ord(c) for c in value)
+        for source in ('# ' + value, 'name = "' + value + '"', 'name = "' + escaped + '"', '"' + escaped + '" = 1'):
+            with self.subTest(kind='synthetic-policy'):
+                with self.assertRaisesRegex(gate.Error, 'policy-key-shaped-material'):
+                    gate.reject_policy_key_shapes(source.encode())
+    def test_both_policy_sources_have_no_google_key_shapes(self):
+        for rel in ('trusted-derived.toml', 'upstream/gitleaks.toml'):
+            raw = (gate.BASE / rel).read_bytes()
+            gate.reject_policy_key_shapes(raw)
+            rule = next(r for r in tomllib.loads(raw.decode())['rules'] if r['id'] == 'gcp-api-key')
+            self.assertNotIn('allowlists', rule)
+    def test_policy_invalid_data_fails_closed(self):
+        for raw in (b'\xff', b'invalid = ['):
+            with self.assertRaisesRegex(gate.Error, 'policy-data-invalid'):
+                gate.reject_policy_key_shapes(raw)
+    def test_policy_opaque_exception_scope(self):
+        values = ['12345678' + '-1234' * 3 + '-123456789abc', hashlib.sha256(b'fabricated opaque exception').hexdigest()[:32]]
+        for value in values:
+            for field in ('regexes', 'stopwords'):
+                for form in (value, '^' + value + '$', '(?:synthetic|' + value + ')'):
+                    raw = ('[allowlist]\n' + field + ' = ' + json.dumps([form])).encode()
+                    with self.assertRaisesRegex(gate.Error, 'policy-opaque-literal-exception'):
+                        gate.reject_policy_key_shapes(raw)
+            gate.reject_policy_key_shapes(('description = ' + json.dumps(value)).encode())
+        gate.reject_policy_key_shapes(('[allowlist]\nregexes = ' + json.dumps([hashlib.sha256(b'synthetic full digest').hexdigest()])).encode())
+    def test_synthetic_allowlist_suppression_removed(self):
+        value = 'AI' + 'za' + base64.urlsafe_b64encode(hashlib.sha256(b'fabricated Google shape only').digest()).decode()[:35]
+        original = (gate.BASE / 'trusted-derived.toml').read_text()
+        offset = original.index('[[rules]]', original.index('id = "gcp-api-key"'))
+        controlled = original[:offset] + '[[rules.allowlists]]\nregexes = ' + json.dumps([value]) + '\n\n' + original[offset:]
+        config = self.repo.parent / 'synthetic-policy.toml'
+        report = self.repo.parent / 'synthetic-report.json'
+        ignore = self.repo.parent / 'empty.ignore'; ignore.write_bytes(b'')
+        for source, expected in ((controlled, 0), (original, 1)):
+            config.write_text(source)
+            result = subprocess.run([str(gate.GITLEAKS), 'stdin', '--config', str(config), '--gitleaks-ignore-path', str(ignore), '--ignore-gitleaks-allow', '--redact=100', '--no-banner', '--log-level', 'error', '--report-format', 'template', '--report-template', str(gate.BASE / 'metadata-report.tmpl'), '--report-path', str(report)], input=value.encode(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, env={'PATH': os.defpath, 'HOME': str(self.repo.parent), 'GOMAXPROCS': '2', 'GOMEMLIMIT': '256MiB'})
+            self.assertIn(result.returncode, (0, 1))
+            rows = json.loads(report.read_text())
+            self.assertEqual(sum(row['RuleID'] == 'gcp-api-key' for row in rows), expected)
     def test_clean(self):
         rev = self.commit({'a.py': 'print("hello")\n'})
         report = gate.check(self.repo, rev)

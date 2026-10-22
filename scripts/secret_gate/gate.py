@@ -11,6 +11,7 @@ import resource
 import subprocess
 import sys
 import tempfile
+import tomllib
 
 BASE = Path(__file__).absolute().parent
 spec = importlib.util.spec_from_file_location('reviewed_git', BASE / 'reviewed/markdown_privacy_gate.py')
@@ -49,11 +50,38 @@ def text_supported(path, raw):
     except UnicodeError:
         raise Error('encoding-not-covered') from None
 
+def reject_policy_key_shapes(raw):
+    # Independent of scanner rules and allowlists, including decoded TOML strings.
+    shape = re.compile(r'AIza[0-9A-Za-z_-]{35}')
+    opaque = re.compile(r'(?<![0-9a-fA-F])(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})(?![0-9a-fA-F])')
+    try:
+        text = raw.decode('utf-8')
+        if shape.search(text):
+            raise Error('policy-key-shaped-material')
+        pending = [(tomllib.loads(text), False, False)]
+    except (UnicodeError, tomllib.TOMLDecodeError):
+        raise Error('policy-data-invalid') from None
+    while pending:
+        value, allowance, literals = pending.pop()
+        if isinstance(value, str) and shape.search(value):
+            raise Error('policy-key-shaped-material')
+        if literals and isinstance(value, str) and opaque.search(value):
+            raise Error('policy-opaque-literal-exception')
+        if isinstance(value, dict):
+            for key, child in value.items():
+                pending.append((key, allowance, False))
+                pending.append((child, allowance or key in ('allowlist', 'allowlists'),
+                                literals or (allowance and key in ('regexes', 'stopwords'))))
+        elif isinstance(value, list):
+            pending.extend((child, allowance, literals) for child in value)
+
 def scan_export(export, mapping, temp, coverage=False, source="."):
     config = temp / 'trusted.toml'
     policy = (BASE / 'trusted-derived.toml').read_bytes()
     coverage_policy = (BASE / 'coverage.toml').read_bytes()
-    if digest(policy) != 'd6849be1028e3d4bd631405a83c7931775a87b3e193c6fc0807800f8d77b2706' or digest(coverage_policy) != '7794cc46f005f0e9069b453f595901934d96d23f4ba74afe4c10815f181818d4':
+    reject_policy_key_shapes(policy)
+    reject_policy_key_shapes((BASE / 'upstream/gitleaks.toml').read_bytes())
+    if digest(policy) != '9eaff7275c46052f5393fb81e4214a1702887503585b5384f5440181007c05a3' or digest(coverage_policy) != '7794cc46f005f0e9069b453f595901934d96d23f4ba74afe4c10815f181818d4':
         raise Error('policy-digest-mismatch')
     report_template = (BASE / 'metadata-report.tmpl').read_bytes()
     if digest(report_template) != '9b8ff567db40a2019b4a2722499cc8ac346dcdf1800ff3ea3e2bdd794591590a':
