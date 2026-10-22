@@ -1,0 +1,10 @@
+
+[[rules]]
+id = "adapter-coverage"
+description = "Internal full-fragment coverage control"
+regex = '''(?s)\A(.).*\z'''
+
+[[rules]]
+id = "adapter-coverage-tail"
+description = "Internal trailing non-LF byte coverage control"
+regex = '''[^\n]\n*\z'''

@@ -1,0 +1,1 @@
+[{{range $i, $f := .}}{{if $i}},{{end}}{{dict "RuleID" $f.RuleID "File" $f.File "StartLine" $f.StartLine "EndLine" $f.EndLine "StartColumn" $f.StartColumn "EndColumn" $f.EndColumn "Tags" $f.Tags | toJson}}{{end}}]
